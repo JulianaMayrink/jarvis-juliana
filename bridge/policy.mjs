@@ -126,44 +126,146 @@ const VETO_EXEMPT = new Set([
   'openrouter__send-feedback',
 ])
 
-export function decideTool(name, allowWrites = false) {
-  if (READ_ONLY_BUILTINS.has(name)) return true
-  if (WRITE_BUILTINS.has(name)) return allowWrites
+/**
+ * The browser tools that change a page: they press, type and submit. Named
+ * rather than matched by verb, because `chrome_navigate` and `chrome_find`
+ * read and must stay free. chromeServer only builds these when writes are on.
+ */
+const CHROME_ACTS = new Set([
+  'chrome_click', 'chrome_type', 'chrome_key', 'chrome_form_input', 'chrome_close_tab',
+])
+
+/**
+ * Whether a call changes something, as opposed to looking at it.
+ *
+ * This is the classification decideTool enforces and the confirmation gate
+ * asks about. Kept as one function so the two can never disagree about what
+ * counts as a write.
+ */
+export function isWrite(name) {
+  if (READ_ONLY_BUILTINS.has(name)) return false
+  if (WRITE_BUILTINS.has(name)) return true
 
   const server = mcpServerOf(name)
-  if (server) {
-    // The HUD, and the interface controls beside it. Both run in this process
-    // and draw on our own screen, so neither is something to withhold —
-    // without them JARVIS has no display at all. They also have to be named
-    // here rather than left to the verb rules below, which read `ui_theme` as
-    // a write and would hold the whole surface back behind allowWrites.
-    if (server === 'jarvis' || server === 'jarvis_ui') return true
+  if (!server) return true // an unknown built-in: treated as a write
 
-    // The browser server gates itself, at construction: chromeServer() only
-    // builds the acting tools — click, type, form input, close tab — when
-    // allowWrites is set, so anything that reaches here at all is something
-    // the same policy has already permitted. Deciding it a second time by
-    // reading verbs out of the name would only get it wrong: `chrome_navigate`
-    // begins with no read verb and would fall to the write branch, which would
-    // withhold the one tool the whole server is for.
-    if (server === 'jarvis_chrome') return true
+  // The HUD and the interface controls draw on our own screen, and the
+  // camera only looks. None of them changes anything outside JARVIS.
+  if (server === 'jarvis' || server === 'jarvis_ui' || server === 'jarvis_eyes') return false
+  if (server === 'jarvis_chrome') return CHROME_ACTS.has(mcpToolOf(name))
 
-    // The camera. Not withheld behind allowWrites: looking changes nothing,
-    // and the real gate is the browser's own camera permission plus an
-    // indicator the user can see for as long as it is live.
-    if (server === 'jarvis_eyes') return true
-
-    const tool = mcpToolOf(name)
-    if (EFFECTFUL_VERB.test(tool) && !VETO_EXEMPT.has(`${server}__${tool}`)) {
-      return allowWrites
-    }
-    // The session tools this bridge is developed inside count as read-only too.
-    if (READ_ONLY_MCP.has(server) || server.startsWith('ccd_session')) return true
-    return READ_VERB.test(tool) ? true : allowWrites
-  }
-  return allowWrites
+  const tool = mcpToolOf(name)
+  if (EFFECTFUL_VERB.test(tool) && !VETO_EXEMPT.has(`${server}__${tool}`)) return true
+  // The session tools this bridge is developed inside count as read-only too.
+  if (READ_ONLY_MCP.has(server) || server.startsWith('ccd_session')) return false
+  return !READ_VERB.test(tool)
 }
 
+export function decideTool(name, allowWrites = false) {
+  return !isWrite(name) || allowWrites
+}
+
+// ---------------------------------------------------------------------------
+// Confirmation
+// ---------------------------------------------------------------------------
+
+/**
+ * What a write is, in words JARVIS can say back: "Você confirma que é para eu
+ * <this>?". Long values are cut, because the whole sentence is spoken.
+ */
+export function confirmationFor(name, input = {}) {
+  const short = (value, max = 140) => {
+    const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+    return text.length > max ? `${text.slice(0, max)}…` : text
+  }
+  const file = (p) => basename(String(p ?? '')) || 'sem nome'
+  if (name === 'Bash') return `rodar o comando ${short(input.command)}`
+  if (name === 'Write') return `criar ou substituir o arquivo ${file(input.file_path)}`
+  if (name === 'Edit' || name === 'MultiEdit') return `editar o arquivo ${file(input.file_path)}`
+  if (name === 'NotebookEdit') return `editar o notebook ${file(input.notebook_path)}`
+  if (name === 'KillShell' || name === 'TaskStop') return 'parar uma tarefa em segundo plano'
+
+  const server = mcpServerOf(name)
+  const tool = (server ? mcpToolOf(name) : name).replace(/[_-]+/g, ' ')
+  const where = server === 'jarvis_chrome' ? 'no seu Chrome' : `pelo serviço ${server ?? 'local'}`
+  const args = input && Object.keys(input).length ? ` com ${short(JSON.stringify(input), 200)}` : ''
+  return `usar ${tool} ${where}${args}`
+}
+
+/** A JSON string with sorted keys, so the same call compares equal however the model ordered it. */
+function stableKey(name, input) {
+  const sort = (value) => {
+    if (Array.isArray(value)) return value.map(sort)
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.keys(value).sort().map((k) => [k, sort(value[k])]))
+    }
+    return value
+  }
+  return JSON.stringify([name, sort(input ?? null)])
+}
+
+/** The one word that releases a write. Accents, case and punctuation are ignored; nothing else is. */
+const confirmWord = (text) =>
+  String(text ?? '')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z]/g, '') === 'confirmo'
+
+/**
+ * The voice confirmation for writes.
+ *
+ * A write is refused until the user says "confirmo" to a question JARVIS asked
+ * about that exact call. Three things hold it together:
+ *
+ *   - The refusal is the mechanism, not the model's good behaviour. The hook
+ *     refuses, and only the bridge's own record of what the user said can lift
+ *     it, so a model that skips the question still gets stopped.
+ *   - Release is for one call, with the same name and the same arguments. The
+ *     model cannot ask for a different write and borrow the confirmation.
+ *   - Any user utterance closes the window. A "confirmo" from an earlier
+ *     question does not survive a conversation moving on.
+ *
+ * `hear` is fed every user utterance, in order, and says whether a pending
+ * write was confirmed, declined, or none was waiting.
+ */
+export function createWriteGate({ now = () => Date.now(), windowMs = 120_000 } = {}) {
+  let pending = null // the last write refused, awaiting an answer
+  let released = null // the one call the user has just confirmed
+
+  return {
+    /** null if the call may run now, otherwise the reason it is held back. */
+    check(name, input) {
+      const key = stableKey(name, input)
+      if (released && released.key === key && now() <= released.until) {
+        released = null
+        return null
+      }
+      const question = `Você confirma que é para eu ${confirmationFor(name, input)}?`
+      pending = { key, question, until: now() + windowMs }
+      return (
+        `Not run yet: the user has to confirm it first. Ask them out loud, in exactly` +
+        ` these words: "${question}" Then stop and wait for their answer. This call` +
+        ` runs only if their next message is exactly "confirmo", and then only if you` +
+        ` make this same call again with the same arguments. Any other answer means it` +
+        ` does not run, so tell them it was not done.`
+      )
+    },
+
+    /** Called for every user utterance. Returns 'confirmed', 'declined' or 'none'. */
+    hear(text) {
+      const waiting = pending
+      pending = null
+      released = null
+      if (!waiting || now() > waiting.until) return 'none'
+      if (confirmWord(text)) {
+        released = { ...waiting, until: now() + windowMs }
+        return 'confirmed'
+      }
+      return 'declined'
+    },
+  }
+}
 
 /**
  * The built-in tools the agent is offered at all.

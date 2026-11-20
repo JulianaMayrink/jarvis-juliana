@@ -30,9 +30,11 @@ import { probeUrl, renderPage } from './page.mjs'
 import {
   builtinTools,
   checkToolUse,
+  createWriteGate,
   decideTool as decidePolicy,
   fetchTargetProblem,
   fileRoots,
+  isWrite,
 } from './policy.mjs'
 
 const PORT = Number(process.env.JARVIS_BRIDGE_PORT ?? 8787)
@@ -300,7 +302,7 @@ const TOOL_ROOTS = fileRoots({
  * including the ones the CLI would otherwise approve on its own without
  * consulting canUseTool — see policy.mjs for the measurement.
  */
-const enforcePolicy = async (input) => {
+const enforcePolicy = async (input, writeGate) => {
   const verdict = checkToolUse(input.tool_name, input.tool_input, {
     allowWrites: ALLOW_WRITES,
     cwd: WORKSPACE,
@@ -311,8 +313,15 @@ const enforcePolicy = async (input) => {
     const problem = await fetchTargetProblem(input.tool_input?.url)
     if (problem) reason = `Blocked: that address cannot be fetched (${problem}).`
   }
+  // A write that policy allows still waits for the user's spoken "confirmo".
+  // Checked after the policy so a refused call is never asked about.
+  let held = false
+  if (!reason && isWrite(input.tool_name)) {
+    reason = writeGate.check(input.tool_name, input.tool_input)
+    held = reason !== null
+  }
   if (!reason) return {}
-  console.log(`[jarvis] tool ${input.tool_name} -> deny (policy)`)
+  console.log(`[jarvis] tool ${input.tool_name} -> deny (${held ? 'awaiting confirmation' : 'policy'})`)
   return {
     hookSpecificOutput: {
       hookEventName: 'PreToolUse',
@@ -1186,6 +1195,13 @@ wss.on('connection', (socket) => {
   const waiting = new Map()
   let asks = 0
 
+  /**
+   * Writes waiting for the user's spoken "confirmo". Per connection, like the
+   * rest of this conversation's state: a confirmation given on one socket must
+   * never release a write requested on another.
+   */
+  const writeGate = createWriteGate()
+
   const ask = (kind, args, timeoutMs = 20_000) =>
     new Promise((resolve, reject) => {
       if (socket.readyState !== socket.OPEN) {
@@ -1332,7 +1348,7 @@ wss.on('connection', (socket) => {
       // Only the built-ins JARVIS uses. Everything else is not merely denied
       // but absent from the model's context. See builtinTools in policy.mjs.
       tools: builtinTools(ALLOW_WRITES),
-      hooks: { PreToolUse: [{ hooks: [enforcePolicy] }] },
+      hooks: { PreToolUse: [{ hooks: [(input) => enforcePolicy(input, writeGate)] }] },
       // No filesystem settings at all. Left to its default the SDK loads
       // ~/.claude/settings.json and settings.local.json exactly as the CLI
       // does — which on a working machine means a bypassPermissions default
@@ -1542,6 +1558,11 @@ wss.on('connection', (socket) => {
     }
 
     if (msg.type === 'ask' && typeof msg.text === 'string') {
+      // Every utterance is offered to a pending confirmation first. It is what
+      // lets "confirmo" release the write that asked for it, and it closes any
+      // pending confirmation the moment the user says something else.
+      const heard = writeGate.hear(msg.text)
+      if (heard !== 'none') console.log(`[jarvis] confirmation ${heard}`)
       /**
        * Queued behind any interrupt that is still settling.
        *
