@@ -88,19 +88,21 @@ export function createConversation({ query, cwd, onMessage, onEnd }) {
   const inbox = createInbox();
   const stream = query({ prompt: inbox, options: baseOptions(cwd) });
 
-  (async () => {
+  const run = async () => {
     try {
       for await (const message of stream) onMessage(message);
-    } catch (err) {
-      onMessage({
-        type: 'bridge_error',
-        message: err instanceof Error ? err.message : String(err),
-      });
     } finally {
       inbox.close();
       onEnd?.();
     }
-  })();
+  };
+
+  run().catch((err) => {
+    onMessage({
+      type: 'bridge_error',
+      message: err instanceof Error ? err.message : String(err),
+    });
+  });
 
   return {
     send(text) {
