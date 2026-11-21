@@ -4,10 +4,14 @@
  * Nesta fase nenhuma ação está habilitada: o Claude não recebe ferramentas
  * (`tools: []`), não usa hooks das configurações do usuário
  * (`disableAllHooks`) e toda permissão pedida é negada (`canUseTool`).
+ * O hook PreToolUse de policy.mjs recusa o que a política não permite,
+ * mesmo chamadas que a CLI aprovaria sozinha.
  * Lê só as configurações do usuário (`settingSources: ['user']`) para
  * encontrar o login (`apiKeyHelper`). Projeto e local ficam de fora.
  * A política de segurança real entra na fase 2.
  */
+
+import { fileRoots, preToolUseHook } from './policy.mjs';
 
 /** Mensagem devolvida ao Claude quando ele tenta usar uma ferramenta. */
 export const DENIED_MESSAGE = 'Nenhuma ação está habilitada nesta fase.';
@@ -19,12 +23,16 @@ export const DENIED_MESSAGE = 'Nenhuma ação está habilitada nesta fase.';
  * @returns {Record<string, unknown>}
  */
 export function baseOptions(cwd) {
+  const roots = fileRoots({ workspace: cwd });
   return {
     cwd,
     settingSources: ['user'],
     settings: { disableAllHooks: true },
     tools: [],
     canUseTool: async () => ({ behavior: 'deny', message: DENIED_MESSAGE }),
+    hooks: {
+      PreToolUse: [{ hooks: [preToolUseHook({ cwd, roots, allowWrites: false })] }],
+    },
   };
 }
 
