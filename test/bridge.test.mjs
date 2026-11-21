@@ -150,6 +150,7 @@ test('baseOptions é fixo: lê só o usuário, sem hooks e sem ferramentas', () 
   assert.deepEqual(options.settingSources, ['user']);
   assert.deepEqual(options.settings, { disableAllHooks: true });
   assert.deepEqual(options.tools, []);
+  assert.equal(options.hooks.PreToolUse.length, 1, 'um hook PreToolUse');
 });
 
 test('rejeita Host estranho (DNS rebinding)', async (t) => {
